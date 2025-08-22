@@ -1,0 +1,12 @@
+    # Ignore large image files stored in images directory
+    images/    
+
+    # Ignore log files
+    *.log
+
+    # Ignore environment variables
+    .env
+
+    # Ignore IDE-specific files
+    .vscode/
+    .idea/
