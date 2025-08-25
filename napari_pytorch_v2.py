@@ -1,312 +1,280 @@
-"""
-Napari ML Interpretability Widget
-- Multi-channel images
-- Classical ML: RandomForest / Linear SVM
-- Tile-level feature importance overlays (like GRAD-CAM)
-- Predictions overlay
-- Clean UI with single progress bar
-"""
-
 import numpy as np
-import time
+import napari
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
-    QSpinBox, QGroupBox, QFileDialog, QProgressBar
+    QWidget, QVBoxLayout, QPushButton, QLabel, QComboBox, QSpinBox,
+    QProgressBar, QFileDialog, QCheckBox
 )
 from qtpy.QtCore import Signal
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
+from napari.layers import Image
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
-import napari
+from sklearn.model_selection import train_test_split
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 from napari.qt.threading import thread_worker
+import shap
 
-# ------------------------------
+try:
+    import cupy as cp
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
+
+# --------------------------
 # Feature extraction
-# ------------------------------
-def extract_features(images):
+# --------------------------
+def extract_features(images, use_gpu=False):
     N,H,W,C = images.shape
     feats = []
-    for n in range(N):
-        img_feats = []
+    xp = cp if use_gpu else np
+    for i in range(N):
+        row = []
         for c in range(C):
-            img_feats.append(images[n,:,:,c].mean())
-            img_feats.append(images[n,:,:,c].std())
-        feats.append(img_feats)
+            chan = images[i,:,:,c]
+            if use_gpu:
+                chan = cp.asarray(chan)
+            row.extend([xp.mean(chan), xp.std(chan)])
+        feats.append(row)
     return np.array(feats)
 
-# ------------------------------
+# --------------------------
 # Main Widget
-# ------------------------------
+# --------------------------
 class MLInterpretWidget(QWidget):
-    progress_signal = Signal(int,str)  # progress %, message
+    progress_signal = Signal(int,str)
+    shap_progress_signal = Signal(int,str)
 
-    def __init__(self, viewer):
+    def __init__(self, viewer: napari.Viewer):
         super().__init__()
         self.viewer = viewer
-        self.targets = None
-        self.encoded_targets = None
         self.model = None
+        self.y_pred = None
+        self.targets = None
+        self.imgs = None
+        self.feats = None
 
         layout = QVBoxLayout()
-        self.setLayout(layout)
 
-        # ------------------ Image & Targets ------------------
-        group_data = QGroupBox("Image & Target Selection")
-        layout_data = QVBoxLayout()
-        group_data.setLayout(layout_data)
-        layout.addWidget(group_data)
+        # Layer selector
+        layout.addWidget(QLabel("Select Image Layer:"))
+        self.layer_combo = QComboBox()
+        layout.addWidget(self.layer_combo)
+        self._update_layer_list()
+        self.viewer.layers.events.inserted.connect(lambda e: self._update_layer_list())
+        self.viewer.layers.events.removed.connect(lambda e: self._update_layer_list())
 
-        layout_data.addWidget(QLabel("Select image layer:"))
-        self.image_combo = QComboBox()
-        layout_data.addWidget(self.image_combo)
-        self._refresh_layers()
-        self.viewer.layers.events.inserted.connect(self._refresh_layers)
-        self.viewer.layers.events.removed.connect(self._refresh_layers)
-        self.viewer.layers.events.reordered.connect(self._refresh_layers)
+        # Load targets
+        self.btn_targets = QPushButton("Load targets.npy")
+        self.btn_targets.clicked.connect(self._load_targets)
+        layout.addWidget(self.btn_targets)
 
-        self.btn_load_targets = QPushButton("Load targets.npy")
-        layout_data.addWidget(self.btn_load_targets)
-        self.btn_load_targets.clicked.connect(self.load_targets)
+        # Train-test split
+        self.split_spin = QSpinBox()
+        self.split_spin.setRange(5,50)
+        self.split_spin.setValue(20)
+        layout.addWidget(QLabel("Test split %:"))
+        layout.addWidget(self.split_spin)
 
-        # ------------------ Data Exploration ------------------
-        group_explore = QGroupBox("Data Exploration")
-        layout_explore = QVBoxLayout()
-        group_explore.setLayout(layout_explore)
-        layout.addWidget(group_explore)
+        # Train button
+        self.btn_train = QPushButton("Train RandomForest")
+        self.btn_train.clicked.connect(self._train_model)
+        layout.addWidget(self.btn_train)
 
-        self.btn_plot_stats = QPushButton("Plot channel statistics")
-        self.btn_show_samples = QPushButton("Show sample images per class")
-        layout_explore.addWidget(self.btn_plot_stats)
-        layout_explore.addWidget(self.btn_show_samples)
-        self.btn_plot_stats.clicked.connect(self.plot_channel_stats)
-        self.btn_show_samples.clicked.connect(self.show_samples)
+        # SHAP overlay button
+        self.channel_checkbox = QCheckBox("Show per-channel importance (instead of mean)")
+        layout.addWidget(self.channel_checkbox)
+        self.btn_shap = QPushButton("Compute SHAP overlay")
+        self.btn_shap.clicked.connect(self._compute_shap_overlay)
+        layout.addWidget(self.btn_shap)
 
-        # ------------------ Model Training ------------------
-        group_model = QGroupBox("Model Training & Metrics")
-        layout_model = QVBoxLayout()
-        group_model.setLayout(layout_model)
-        layout.addWidget(group_model)
-
-        layout_model.addWidget(QLabel("Select model:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["RandomForest","SVM"])
-        layout_model.addWidget(self.model_combo)
-
-        h_test = QHBoxLayout()
-        h_test.addWidget(QLabel("Test size (%)"))
-        self.test_spin = QSpinBox()
-        self.test_spin.setRange(5,95)
-        self.test_spin.setValue(20)
-        h_test.addWidget(self.test_spin)
-        layout_model.addLayout(h_test)
-
-        self.btn_train = QPushButton("Train Model")
-        self.btn_plot_cm = QPushButton("Plot Confusion Matrix")
-        layout_model.addWidget(self.btn_train)
-        layout_model.addWidget(self.btn_plot_cm)
-        self.btn_train.clicked.connect(self.run_train_model)
-        self.btn_plot_cm.clicked.connect(self.plot_confusion_matrix)
-
-        # ------------------ Overlays ------------------
-        group_overlay = QGroupBox("Overlays")
-        layout_overlay = QVBoxLayout()
-        group_overlay.setLayout(layout_overlay)
-        layout.addWidget(group_overlay)
-
-        self.btn_pred_overlay = QPushButton("Add Predictions Overlay")
-        self.btn_tile_overlay = QPushButton("Add Tile Feature Importance Overlay")
-        layout_overlay.addWidget(self.btn_pred_overlay)
-        layout_overlay.addWidget(self.btn_tile_overlay)
-        self.btn_pred_overlay.clicked.connect(self.add_overlay)
-        self.btn_tile_overlay.clicked.connect(self.run_tile_overlay)
-
-        # ------------------ Progress & Status ------------------
+        # Progress bars
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
-        self.progress.setValue(0)
-        self.progress.setFormat("%p% - %v")
-        self.progress_signal.connect(self._update_progress)
-
-        self.message_label = QLabel("")
+        self.shap_progress = QProgressBar()
+        layout.addWidget(self.shap_progress)
+        self.message_label = QLabel("Idle")
         layout.addWidget(self.message_label)
 
-        layout.addStretch()
+        # Confusion matrix
+        self.cm_fig = Figure(figsize=(4,3))
+        self.cm_canvas = FigureCanvas(self.cm_fig)
+        layout.addWidget(self.cm_canvas)
 
-    # ------------------ Helpers ------------------
-    def _refresh_layers(self,event=None):
-        current = self.image_combo.currentText()
-        self.image_combo.clear()
-        for layer in self.viewer.layers:
-            if isinstance(layer, napari.layers.Image):
-                self.image_combo.addItem(layer.name)
-        index = self.image_combo.findText(current)
-        if index>=0:
-            self.image_combo.setCurrentIndex(index)
-        elif self.image_combo.count()>0:
-            self.image_combo.setCurrentIndex(0)
+        self.progress_signal.connect(self._update_progress)
+        self.shap_progress_signal.connect(self._update_shap_progress)
+        self.setLayout(layout)
+
+    # --------------------------
+    # Layer handling
+    # --------------------------
+    def _update_layer_list(self):
+        current_layer = self.layer_combo.currentText()
+        self.layer_combo.blockSignals(True)
+        self.layer_combo.clear()
+        image_layers = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
+        for layer in image_layers:
+            self.layer_combo.addItem(layer.name)
+        if image_layers:
+            self.layer_combo.setCurrentText(image_layers[-1].name)
+        if current_layer in [layer.name for layer in image_layers]:
+            self.layer_combo.setCurrentText(current_layer)
+        self.layer_combo.blockSignals(False)
 
     def _get_images(self):
-        if self.image_combo.count()==0:
-            self.message_label.setText("No image layer loaded!")
+        selected_name = self.layer_combo.currentText()
+        if not selected_name:
             return None
-        return self.viewer.layers[self.image_combo.currentText()].data
+        layer = self.viewer.layers[selected_name]
+        data = layer.data
+        if data.ndim == 3:
+            data = data[None,...]
+        return data
 
-    def load_targets(self):
+    # --------------------------
+    # Load targets
+    # --------------------------
+    def _load_targets(self):
         path,_ = QFileDialog.getOpenFileName(self,"Select targets.npy","","NumPy files (*.npy)")
         if path:
-            targets_raw = np.load(path)
-            self.targets = targets_raw
-            self.encoded_targets = LabelEncoder().fit_transform(targets_raw)
-            self.message_label.setText(f"Loaded {len(targets_raw)} targets")
+            self.targets = np.load(path)
+            self.message_label.setText(f"Targets loaded: {self.targets.shape}")
 
-    def plot_channel_stats(self):
-        images = self._get_images()
-        if images is None or self.encoded_targets is None:
-            self.message_label.setText("Load images and targets first")
+    # --------------------------
+    # Training
+    # --------------------------
+    def _train_model(self):
+        self.imgs = self._get_images()
+        if self.imgs is None or self.targets is None:
+            self.message_label.setText("Need images and targets")
             return
-        N,H,W,C = images.shape
-        num_classes = len(np.unique(self.encoded_targets))
-        fig, axes = plt.subplots(1,C,figsize=(3*C,3))
-        for c in range(C):
-            means = [images[self.encoded_targets==t,:,:,c].mean() for t in range(num_classes)]
-            sns.barplot(x=list(range(num_classes)),y=means,ax=axes[c])
-            axes[c].set_title(f"Channel {c} mean per class")
-        plt.show()
 
-    def show_samples(self):
-        images = self._get_images()
-        if images is None or self.encoded_targets is None:
-            self.message_label.setText("Load images and targets first")
-            return
-        num_classes = len(np.unique(self.encoded_targets))
-        for t in range(num_classes):
-            idx = np.where(self.encoded_targets==t)[0][:3]
-            for i in idx:
-                self.viewer.add_image(images[i],name=f"class{t}_sample{i}")
+        layer = self.viewer.layers[self.layer_combo.currentText()]
+        N,H,W,C = self.imgs.shape
 
-    # ------------------ Training Worker ------------------
-    def run_train_model(self):
-        images = self._get_images()
-        if images is None or self.encoded_targets is None:
-            self.message_label.setText("Load images and targets first")
-            return
-        X = extract_features(images)
-        y = self.encoded_targets
-        test_size = self.test_spin.value()/100
-        X_train,X_test,y_train,y_test = train_test_split(X,y,test_size=test_size,random_state=42)
-        self.X_test,self.y_test = X_test,y_test
+        self.progress_signal.emit(0,"Extracting features...")
+        self.feats = extract_features(self.imgs,use_gpu=False)
 
-        model_name = self.model_combo.currentText()
-        if model_name=="RandomForest":
-            self.model = RandomForestClassifier(n_estimators=100,random_state=42)
-        else:
-            self.model = SVC(probability=True)
-
-        # Launch threaded training
-        self._train_worker = self._train_model_worker(X_train,y_train)
-        self._train_worker.returned.connect(lambda _: self.message_label.setText("Training completed"))
-        self._train_worker.start()
-
-    @thread_worker
-    def _train_model_worker(self,X_train,y_train):
-        n_epochs = 10  # simulate batch training
-        for i in range(n_epochs):
-            time.sleep(0.1)  # simulate work
-            self.progress_signal.emit(int((i+1)/n_epochs*100),f"Training epoch {i+1}/{n_epochs}")
-        self.model.fit(X_train,y_train)
-        return self.model
-
-    # ------------------ Confusion Matrix ------------------
-    def plot_confusion_matrix(self):
-        if not hasattr(self,"y_pred"):
-            self.message_label.setText("Train model first")
-            return
-        cm = confusion_matrix(self.y_test,self.y_pred)
-        plt.figure(figsize=(5,5))
-        sns.heatmap(cm,annot=True,fmt="d",cmap="Blues")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.show()
-
-    # ------------------ Prediction Overlay ------------------
-    def add_overlay(self):
-        if not hasattr(self,"model") or self.model is None:
-            self.message_label.setText("Train model first")
-            return
-        images = self._get_images()
-        X = extract_features(images)
-        self.y_pred = self.model.predict(X)
-        self.viewer.add_points(
-            np.column_stack([np.arange(len(self.y_pred)), np.zeros(len(self.y_pred))]),
-            size=10,
-            face_color=self.y_pred,
-            name="Predictions"
+        X_train,X_test,y_train,y_test = train_test_split(
+            self.feats,self.targets,test_size=self.split_spin.value()/100.0,random_state=0
         )
-        self.message_label.setText("Predictions overlay added")
 
-    # ------------------ Tile Feature Importance Overlay ------------------
-    def run_tile_overlay(self,tile_size=32):
-        images = self._get_images()
-        if images is None or self.model is None:
+        @thread_worker(start_thread=True)
+        def train_worker():
+            self.progress_signal.emit(10,"Training RandomForest...")
+            model = RandomForestClassifier(n_estimators=200,random_state=0)
+            model.fit(X_train,y_train)
+            preds = model.predict(self.feats)
+            from sklearn.metrics import confusion_matrix
+            cm = confusion_matrix(y_test, model.predict(X_test))
+            return model,preds,cm
+
+        def on_done(result):
+            self.model,self.y_pred,cm = result
+            self.progress_signal.emit(100,"Training complete, predictions ready")
+
+            # Predictions overlay
+            if layer.data.ndim == 3:  # single image
+                pred_overlay = np.zeros(layer.data.shape[:2],dtype=np.int32)
+                pred_overlay[:,:] = self.y_pred[0]
+            else:
+                pred_overlay = np.zeros(layer.data.shape[:3],dtype=np.int32)
+                for i,pred in enumerate(self.y_pred):
+                    pred_overlay[i,:,:] = pred
+            self.viewer.add_image(pred_overlay,name="Predictions Overlay",colormap="viridis",blending="additive")
+
+            # Confusion matrix
+            self.cm_fig.clear()
+            ax = self.cm_fig.add_subplot(111)
+            ax.imshow(cm,cmap="Blues")
+            ax.set_title("Confusion Matrix")
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    ax.text(j,i,str(cm[i,j]),ha="center",va="center",color="red")
+            self.cm_canvas.draw()
+
+        worker = train_worker()
+        worker.returned.connect(on_done)
+
+    # --------------------------
+    # SHAP overlay (batch-wise)
+    # --------------------------
+    def _compute_shap_overlay(self):
+        if self.model is None or self.imgs is None:
             self.message_label.setText("Train model first")
             return
-        self._tile_worker = self._tile_overlay_worker(images,tile_size)
-        self._tile_worker.returned.connect(lambda overlays: self.viewer.add_image(
-            overlays,name=f"TileImportance_{self.model_combo.currentText()}",
-            blending='additive',colormap='viridis'
-        ))
-        self._tile_worker.start()
 
-    @thread_worker
-    def _tile_overlay_worker(self,images,tile_size):
-        N,H,W,C = images.shape
-        if hasattr(self.model,"feature_importances_"):
-            importances = self.model.feature_importances_
-        elif hasattr(self.model,"coef_"):
-            importances = np.abs(self.model.coef_).mean(axis=0)
-        else:
-            self.progress_signal.emit(0,"Cannot compute feature importances")
-            return np.zeros_like(images)
-        channel_importance = np.zeros(C)
-        for c in range(C):
-            channel_importance[c] = importances[c*2]+importances[c*2+1]
-        channel_importance /= (channel_importance.max()+1e-8)
+        layer = self.viewer.layers[self.layer_combo.currentText()]
+        N,H,W,C = self.imgs.shape
+        tile_size = 32
+        all_tile_feats = []
+        tile_coords = []
 
-        overlays = np.zeros_like(images,dtype=np.float32)
-        total_steps = N*C
-        step = 0
-        for n in range(N):
-            for c in range(C):
-                img = images[n,:,:,c].astype(np.float32)
-                H_tiles = H//tile_size
-                W_tiles = W//tile_size
-                tile_map = np.zeros_like(img)
-                for i in range(H_tiles):
-                    for j in range(W_tiles):
-                        tile = img[i*tile_size:(i+1)*tile_size,j*tile_size:(j+1)*tile_size]
-                        tile_feat = np.array([tile.mean(),tile.std()])
-                        tile_map[i*tile_size:(i+1)*tile_size,j*tile_size:(j+1)*tile_size] = tile_feat.sum()*channel_importance[c]
-                tile_map = (tile_map-tile_map.min())/(tile_map.max()-tile_map.min()+1e-8)
-                overlays[n,:,:,c] = tile_map
-                step += 1
-                percent = int(step/total_steps*100)
-                self.progress_signal.emit(percent,f"Tile overlay: image {n+1}/{N} channel {c+1}/{C}")
-        self.progress_signal.emit(100,"Tile overlay completed")
-        return overlays
+        # Precompute tile features
+        for i in range(N):
+            for y0 in range(0,H,tile_size):
+                for x0 in range(0,W,tile_size):
+                    y1 = min(y0+tile_size,H)
+                    x1 = min(x0+tile_size,W)
+                    feats_tile = []
+                    for c in range(C):
+                        chan = self.imgs[i,y0:y1,x0:x1,c]
+                        feats_tile.extend([chan.mean(),chan.std()])
+                    all_tile_feats.append(feats_tile)
+                    tile_coords.append((i,y0,y1,x0,x1))
+        all_tile_feats = np.array(all_tile_feats)
 
-    # ------------------ Progress Update ------------------
-    def _update_progress(self,percent,message):
-        self.progress.setValue(percent)
-        if message:
-            self.message_label.setText(message)
+        @thread_worker(start_thread=True)
+        def shap_worker():
+            self.shap_progress_signal.emit(0,"Starting SHAP...")
+            explainer = shap.TreeExplainer(self.model)
+            overlay = np.zeros((N,H,W,C if self.channel_checkbox.isChecked() else 1),dtype=np.float32)
+            batch_size = 500
+            for start in range(0,len(all_tile_feats),batch_size):
+                batch_feats = all_tile_feats[start:start+batch_size]
+                shap_vals = explainer.shap_values(batch_feats)
+                if isinstance(shap_vals,list):
+                    shap_vals = np.mean([np.abs(sv) for sv in shap_vals],axis=0)
+                else:
+                    shap_vals = np.abs(shap_vals)
 
-# ------------------------------
-# Launch in Napari
-# ------------------------------
+                for idx,val in enumerate(shap_vals):
+                    i,y0,y1,x0,x1 = tile_coords[start+idx]
+                    if self.channel_checkbox.isChecked():
+                        for c in range(C):
+                            overlay[i,y0:y1,x0:x1,c] = val[c*2]+val[c*2+1]
+                    else:
+                        overlay_val = val.sum()
+                        overlay[i,y0:y1,x0:x1,0] = overlay_val
+
+                progress = int((start+batch_size)/len(all_tile_feats)*100)
+                self.shap_progress_signal.emit(min(progress,100),f"Computing SHAP: {min(progress,100)}%")
+            return overlay
+
+        def on_done(result):
+            overlay = result
+            if self.channel_checkbox.isChecked():
+                self.viewer.add_image(overlay,name="Per-channel SHAP",colormap="magma",blending="additive",channel_axis=-1)
+            else:
+                self.viewer.add_image(overlay[...,0],name="Mean SHAP",colormap="magma",blending="additive")
+            self.shap_progress_signal.emit(100,"SHAP computation complete")
+
+        worker = shap_worker()
+        worker.returned.connect(on_done)
+
+    # --------------------------
+    # Progress updaters
+    # --------------------------
+    def _update_progress(self,val,message):
+        self.progress.setValue(val)
+        self.message_label.setText(message)
+    def _update_shap_progress(self,val,message):
+        self.shap_progress.setValue(val)
+        self.message_label.setText(message)
+
+# --------------------------
+# Launch Napari
+# --------------------------
 if __name__=="__main__":
     viewer = napari.Viewer()
     widget = MLInterpretWidget(viewer)
